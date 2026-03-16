@@ -1,7 +1,6 @@
 import os
 
-VAULT_PATH = os.path.expanduser("~/Documents/Cloud Vault/Hewlett")
-
+VAULT_PATH = os.path.expanduser("~/Documents/Cloud Vault")
 CHROMA_PATH = "outputs/chroma_db"
 
 # ollama embedding model (run: ollama pull nomic-embed-text)
