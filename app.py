@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+
 import anthropic
 import chromadb
 import requests
@@ -17,6 +18,7 @@ from config import (
     TOP_K,
     VAULT_PATH,
 )
+
 
 st.set_page_config(
     page_title="Obsidian Chat",
@@ -49,16 +51,51 @@ def get_embedding(text: str) -> list[float]:
     return response.json()["embedding"]
 
 def whole_word_match(word, text):
-    """return true if word appears as a whole word in text (case-insensitive).
-    normalizes underscores and json list syntax before matching so that
-    tags like '["People/Firstname_Lastname"]' match queries for 'firstname' or 'lastname'.
-    """
-    # normalize: lowercase, replace underscores with spaces, strip json
     normalized = text.lower().replace("_", " ").replace("[", " ").replace("]", " ").replace('"', " ")
     pattern = re.compile(r'\b' + re.escape(word.lower()) + r'\b')
     return bool(pattern.search(normalized))
 
-def keyword_scan(query: str, collection, folder_filter: str = None) -> list[dict]:
+def get_vaults(collection) -> list[str]:
+    try:
+        all_meta = collection.get(include=["metadatas"])["metadatas"]
+        vaults = sorted(set(m.get("vault", "") for m in all_meta if m.get("vault")))
+        return vaults
+    except Exception:
+        return []
+
+
+def get_folders_for_vault(collection, vault_name: str = None) -> list[str]:
+    """get unique folders, optionally filtered to a specific vault."""
+    try:
+        all_meta = collection.get(include=["metadatas"])["metadatas"]
+        folders = set()
+        for m in all_meta:
+            if vault_name and m.get("vault") != vault_name:
+                continue
+            folder = m.get("folder", "")
+            if folder:
+                folders.add(folder)
+        return sorted(folders)
+    except Exception:
+        return []
+
+
+def build_where_clause(vault_filter: str, folder_filter: str) -> dict | None:
+    """build a chroma where clause from vault and folder filters."""
+    conditions = []
+    if vault_filter:
+        conditions.append({"vault": {"$eq": vault_filter}})
+    if folder_filter:
+        conditions.append({"folder": {"$eq": folder_filter}})
+
+    if len(conditions) == 0:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
+
+
+def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter: str = None) -> list[dict]:
     stopwords = {
         "the", "was", "last", "time", "when", "did", "with", "have", "about",
         "what", "that", "this", "for", "chatted", "talked", "met", "meeting",
@@ -67,7 +104,6 @@ def keyword_scan(query: str, collection, folder_filter: str = None) -> list[dict
         "its", "not", "from", "all", "are", "but", "your"
     }
 
-    # extract words from query
     words = [
         w.strip("?,.'\"!").lower()
         for w in query.split()
@@ -85,13 +121,14 @@ def keyword_scan(query: str, collection, folder_filter: str = None) -> list[dict
         title = meta.get("title", "").lower()
         tags = meta.get("tags", "").lower()
         folder = meta.get("folder", "")
+        vault = meta.get("vault", "")
         source_lower = source.lower()
 
-        if folder_filter and folder_filter != "All folders":
-            if folder != folder_filter:
-                continue
+        if vault_filter and vault != vault_filter:
+            continue
+        if folder_filter and folder != folder_filter:
+            continue
 
-        # match against tags, title, and source path
         hit = any(
             whole_word_match(w, tags) or
             whole_word_match(w, title) or
@@ -100,12 +137,12 @@ def keyword_scan(query: str, collection, folder_filter: str = None) -> list[dict
         )
 
         if hit:
-            # keep longest chunk per source
             existing = source_best.get(source)
             if existing is None or len(doc) > len(existing["text"]):
                 source_best[source] = {
                     "text": doc,
                     "source": source,
+                    "vault": vault,
                     "title": meta.get("title", ""),
                     "folder": folder,
                     "modified": meta.get("modified", ""),
@@ -117,13 +154,11 @@ def keyword_scan(query: str, collection, folder_filter: str = None) -> list[dict
     keyword_chunks.sort(key=lambda x: x.get("modified", ""), reverse=True)
     return keyword_chunks[:TOP_K]
 
-def retrieve_context(query: str, collection, folder_filter: str = None) -> list[dict]:
-    """keyword scan + semantic search, merged and de-duped"""
-    query_embedding = get_embedding(query)
 
-    where_clause = None
-    if folder_filter and folder_filter != "All folders":
-        where_clause = {"folder": {"$eq": folder_filter}}
+def retrieve_context(query: str, collection, vault_filter: str = None, folder_filter: str = None) -> list[dict]:
+    """hybrid retrieval keyword scan + semantic search, merged and deduplicated."""
+    query_embedding = get_embedding(query)
+    where_clause = build_where_clause(vault_filter, folder_filter)
 
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -141,6 +176,7 @@ def retrieve_context(query: str, collection, folder_filter: str = None) -> list[
         semantic_chunks.append({
             "text": doc,
             "source": meta.get("source", "unknown"),
+            "vault": meta.get("vault", ""),
             "title": meta.get("title", ""),
             "folder": meta.get("folder", ""),
             "modified": meta.get("modified", ""),
@@ -148,7 +184,7 @@ def retrieve_context(query: str, collection, folder_filter: str = None) -> list[
             "match_type": "semantic",
         })
 
-    keyword_chunks = keyword_scan(query, collection, folder_filter)
+    keyword_chunks = keyword_scan(query, collection, vault_filter, folder_filter)
     seen_sources = set(c["source"] for c in keyword_chunks)
 
     merged = keyword_chunks[:]
@@ -159,8 +195,9 @@ def retrieve_context(query: str, collection, folder_filter: str = None) -> list[
 
     return merged[:TOP_K]
 
+
 def build_system_prompt() -> str:
-    return """You are a knowledgeable assistant with access to the user's Obsidian notes. 
+    return """You are a knowledgeable assistant with access to the user's Obsidian notes.
 Your job is to answer questions grounded in those notes, synthesizing and connecting ideas across them.
 
 Guidelines:
@@ -175,25 +212,15 @@ Guidelines:
 def format_context(chunks: list[dict]) -> str:
     parts = []
     for i, chunk in enumerate(chunks, 1):
+        vault_label = f" [{chunk['vault']}]" if chunk.get("vault") else ""
         parts.append(
-            f"[Note {i}: {chunk['title']} | {chunk['source']} | similarity: {chunk['similarity']}]\n{chunk['text']}"
+            f"[Note {i}: {chunk['title']}{vault_label} | {chunk['source']} | similarity: {chunk['similarity']}]\n{chunk['text']}"
         )
     return "\n\n---\n\n".join(parts)
 
 
-def get_folders(collection) -> list[str]:
-    try:
-        all_meta = collection.get(include=["metadatas"])["metadatas"]
-        folders = sorted(set(m.get("folder", "") for m in all_meta if m.get("folder")))
-        return ["All folders"] + folders
-    except Exception:
-        return ["All folders"]
-
-
 def ask_claude(question: str, context_chunks: list[dict], chat_history: list) -> tuple[str, dict]:
-
     client = get_anthropic_client()
-
     context_text = format_context(context_chunks)
 
     messages = []
@@ -212,37 +239,32 @@ def ask_claude(question: str, context_chunks: list[dict], chat_history: list) ->
         messages=messages,
     )
 
-    # claude sonnet pricing $3 per 1M input tokens, $15 per 1M output tokens
     input_tokens = response.usage.input_tokens
     output_tokens = response.usage.output_tokens
     input_cost = (input_tokens / 1_000_000) * 3.00
     output_cost = (output_tokens / 1_000_000) * 15.00
-    total_cost = input_cost + output_cost
 
     usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "cost_usd": total_cost,
+        "cost_usd": input_cost + output_cost,
     }
 
     return response.content[0].text, usage
 
-
 st.title("Obsidian Chat")
-st.caption(f"Vault: `{VAULT_PATH}`")
+st.caption(f"Vault root: `{VAULT_PATH}`")
 
 collection = get_chroma_collection()
 
 if collection is None:
-    st.error(
-        "No index found. Run `python index.py` first to index your vault.",
-        icon="⚠️",
-    )
+    st.error("No index found. Run `python index.py` first to index your vaults.")
     st.stop()
 
 doc_count = collection.count()
 
+# init session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_cost" not in st.session_state:
@@ -253,8 +275,22 @@ if "session_tokens" not in st.session_state:
 with st.sidebar:
     st.header("Settings")
 
-    folders = get_folders(collection)
-    folder_filter = st.selectbox("Scope to folder", folders)
+    # vault selector
+    vaults = get_vaults(collection)
+    vault_options = ["All vaults"] + vaults
+    selected_vault_label = st.selectbox("Vault", vault_options)
+    vault_filter = None if selected_vault_label == "All vaults" else selected_vault_label
+
+    # folder selector dynamic based on vault selection
+    folders = get_folders_for_vault(collection, vault_filter)
+    if folders:
+        folder_options = ["All folders"] + folders
+        selected_folder_label = st.selectbox("Folder", folder_options)
+        folder_filter = None if selected_folder_label == "All folders" else selected_folder_label
+    else:
+        folder_filter = None
+        if vault_filter:
+            st.caption("No subfolders found in this vault.")
 
     st.divider()
     st.metric("Indexed chunks", doc_count)
@@ -270,10 +306,10 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption("To re-index your vault:")
+    st.caption("To re-index your vaults:")
     st.code("python index.py --update", language="bash")
 
-# check ollama
+# check ollama is running
 try:
     requests.get(f"{EMBED_BASE_URL}/api/tags", timeout=2)
     ollama_ok = True
@@ -284,11 +320,11 @@ if not ollama_ok:
     st.warning("Ollama is not running. Start it with `ollama serve` in your terminal.")
     st.stop()
 
-# check api key
 if not os.environ.get("ANTHROPIC_API_KEY"):
     st.error("ANTHROPIC_API_KEY environment variable not set.")
     st.stop()
 
+# render chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -301,8 +337,9 @@ for msg in st.session_state.messages:
         if msg.get("sources"):
             with st.expander("Sources", expanded=False):
                 for src in msg["sources"]:
+                    vault_label = f" [{src['vault']}]" if src.get("vault") else ""
                     st.markdown(
-                        f"**{src['title']}** `{src['source']}` — similarity: {src['similarity']}"
+                        f"**{src['title']}**{vault_label} `{src['source']}` — similarity: {src['similarity']}"
                     )
 
 # chat input
@@ -315,7 +352,7 @@ if prompt := st.chat_input("Ask a question about your notes..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching notes..."):
             try:
-                chunks = retrieve_context(prompt, collection, folder_filter)
+                chunks = retrieve_context(prompt, collection, vault_filter, folder_filter)
             except Exception as e:
                 st.error(f"Retrieval error: {e}")
                 st.stop()
@@ -328,7 +365,6 @@ if prompt := st.chat_input("Ask a question about your notes..."):
                 st.stop()
 
         st.markdown(answer)
-
         st.caption(
             f"↑ {usage['input_tokens']:,} input · {usage['output_tokens']:,} output · "
             f"{usage['total_tokens']:,} total tokens · ${usage['cost_usd']:.4f}"
@@ -337,8 +373,9 @@ if prompt := st.chat_input("Ask a question about your notes..."):
         if chunks:
             with st.expander("Sources", expanded=False):
                 for src in chunks:
+                    vault_label = f" [{src['vault']}]" if src.get("vault") else ""
                     st.markdown(
-                        f"**{src['title']}** `{src['source']}` — similarity: {src['similarity']}"
+                        f"**{src['title']}**{vault_label} `{src['source']}` — similarity: {src['similarity']}"
                     )
 
     st.session_state.session_cost += usage["cost_usd"]
