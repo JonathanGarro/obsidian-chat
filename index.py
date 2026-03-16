@@ -21,8 +21,8 @@ from config import (
     EXCLUDE_FOLDERS,
 )
 
-
 def get_embedding(text: str) -> list[float]:
+    """get embedding from ollama."""
     response = requests.post(
         f"{EMBED_BASE_URL}/api/embeddings",
         json={"model": EMBED_MODEL, "prompt": text},
@@ -31,8 +31,8 @@ def get_embedding(text: str) -> list[float]:
     response.raise_for_status()
     return response.json()["embedding"]
 
-
 def parse_frontmatter(content: str) -> tuple[dict, str]:
+    """extract yaml frontmatter and return (metadata, body)."""
     if not content.startswith("---"):
         return {}, content
     try:
@@ -44,22 +44,15 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     except (ValueError, yaml.YAMLError):
         return {}, content
 
-
 def clean_markdown(text: str) -> str:
-    # resolve wikilinks to just the display text
     text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
     text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
-    # remove tags
     text = re.sub(r"#\w+", "", text)
-    # remove html comments
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    # collapse whitespace
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
 def chunk_by_headers(text: str, max_tokens: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    # split on markdown headers
     sections = re.split(r"(?m)(?=^#{1,3} )", text)
     chunks = []
 
@@ -67,11 +60,9 @@ def chunk_by_headers(text: str, max_tokens: int = CHUNK_SIZE, overlap: int = CHU
         section = section.strip()
         if not section:
             continue
-        # rough token estimate 4 chars per token
         if len(section) / 4 <= max_tokens:
             chunks.append(section)
         else:
-            # split long sections into overlapping windows
             words = section.split()
             window = max_tokens * 4 // 6
             step = window - overlap
@@ -84,6 +75,7 @@ def chunk_by_headers(text: str, max_tokens: int = CHUNK_SIZE, overlap: int = CHU
 
 
 def file_hash(path: Path) -> str:
+    """md5 hash of file contents for change detection."""
     return hashlib.md5(path.read_bytes()).hexdigest()
 
 def collect_files(vault_path: str) -> list[tuple[Path, str]]:
@@ -104,12 +96,11 @@ def collect_files(vault_path: str) -> list[tuple[Path, str]]:
     return sorted(results, key=lambda x: x[0])
 
 def build_index(update_only: bool = False):
-    print(f"vault: {VAULT_PATH}")
+    print(f"vault root: {VAULT_PATH}")
     print(f"chroma db: {CHROMA_PATH}")
     print(f"mode: {'incremental update' if update_only else 'full index'}")
-    print()
 
-    # check ollama
+    # check ollama is running
     try:
         requests.get(f"{EMBED_BASE_URL}/api/tags", timeout=5)
     except requests.ConnectionError:
@@ -132,11 +123,12 @@ def build_index(update_only: bool = False):
     files = collect_files(VAULT_PATH)
     print(f"found {len(files)} markdown files")
 
+    # track vaults
+    vault_counts: dict[str, int] = {}
     added = 0
     skipped = 0
     updated = 0
-
-    for file_path in files:
+    for file_path, vault_name in files:
         rel_path = str(file_path.relative_to(VAULT_PATH))
         current_hash = file_hash(file_path)
 
@@ -144,7 +136,6 @@ def build_index(update_only: bool = False):
             skipped += 1
             continue
 
-        # if file was previously indexed remove old chunks
         if rel_path in registry:
             existing = collection.get(where={"source": rel_path})
             if existing["ids"]:
@@ -179,23 +170,19 @@ def build_index(update_only: bool = False):
             "source": rel_path,
             "vault": vault_name,
             "title": frontmatter.get("title", file_path.stem),
-            "tags": json.dumps(tags),  # chroma requires scalar values
-            "folder": str(Path(rel_path).parent),
+            "tags": json.dumps(tags),
+            "folder": folder_within_vault,
             "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
         }
 
-        # build a context prefix from title and tags to prepend to each chunk
         tag_string = " ".join(tags) if tags else ""
         context_prefix = f"Note: {file_path.stem}"
         if tag_string:
             context_prefix += f"\nTags: {tag_string}"
         context_prefix += "\n\n"
 
-        # embed and store each chunk
         for i, chunk in enumerate(chunks):
             chunk_id = f"{rel_path}::chunk_{i}"
-            # prepend title/tags to the text before embedding so name-based
-            # queries match on metadata as well as content
             enriched_chunk = context_prefix + chunk
             try:
                 embedding = get_embedding(enriched_chunk)
@@ -206,7 +193,7 @@ def build_index(update_only: bool = False):
             collection.upsert(
                 ids=[chunk_id],
                 embeddings=[embedding],
-                documents=[chunk],  # store original chunk (without prefix) for claude context
+                documents=[chunk],
                 metadatas=[{**base_metadata, "chunk_index": i}],
             )
 
@@ -217,13 +204,14 @@ def build_index(update_only: bool = False):
     Path(CHROMA_PATH).mkdir(parents=True, exist_ok=True)
     registry_path.write_text(json.dumps(registry, indent=2))
 
-    print()
     print(f"done. added: {added}, updated: {updated}, skipped: {skipped}")
+    for vault_name, count in sorted(vault_counts.items()):
+        print(f"  {vault_name or 'root'}: {count} files")
     print(f"total documents in collection: {collection.count()}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="index obsidian vault into chromadb")
+    parser = argparse.ArgumentParser(description="index obsidian vaults into chromadb")
     parser.add_argument(
         "--update",
         action="store_true",
