@@ -170,6 +170,7 @@ def build_index(update_only: bool = False):
 
         base_metadata = {
             "source": rel_path,
+            "vault": vault_name,
             "title": frontmatter.get("title", file_path.stem),
             "tags": json.dumps(tags),  # chroma requires scalar values
             "folder": str(Path(rel_path).parent),
@@ -203,7 +204,8 @@ def build_index(update_only: bool = False):
             )
 
         registry[rel_path] = current_hash
-        print(f"  indexed: {rel_path} ({len(chunks)} chunks)")
+        vault_counts[vault_name] = vault_counts.get(vault_name, 0) + 1
+        print(f"  [{vault_name or 'root'}] {rel_path} ({len(chunks)} chunks)")
 
     Path(CHROMA_PATH).mkdir(parents=True, exist_ok=True)
     registry_path.write_text(json.dumps(registry, indent=2))
