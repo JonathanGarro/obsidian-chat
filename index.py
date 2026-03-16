@@ -86,18 +86,22 @@ def chunk_by_headers(text: str, max_tokens: int = CHUNK_SIZE, overlap: int = CHU
 def file_hash(path: Path) -> str:
     return hashlib.md5(path.read_bytes()).hexdigest()
 
-
-def collect_files(vault_path: str) -> list[Path]:
+def collect_files(vault_path: str) -> list[tuple[Path, str]]:
     root = Path(vault_path)
-    files = []
+    results = []
+
     for ext in INCLUDE_EXTENSIONS:
         for f in root.rglob(f"*{ext}"):
-            # check if any part of the path is in excluded folders
             parts = f.relative_to(root).parts
+            # determine vault name from top-level directory
+            vault_name = parts[0] if len(parts) > 1 else ""
+            # skip excluded folders (check all path parts)
             if any(part in EXCLUDE_FOLDERS for part in parts):
                 continue
-            files.append(f)
-    return sorted(files)
+
+            results.append((f, vault_name))
+
+    return sorted(results, key=lambda x: x[0])
 
 def build_index(update_only: bool = False):
     print(f"vault: {VAULT_PATH}")
@@ -167,6 +171,9 @@ def build_index(update_only: bool = False):
         tags = frontmatter.get("tags", [])
         if isinstance(tags, str):
             tags = [tags]
+
+        rel_parts = Path(rel_path).parts
+        folder_within_vault = str(Path(*rel_parts[1:-1])) if len(rel_parts) > 2 else ""
 
         base_metadata = {
             "source": rel_path,
