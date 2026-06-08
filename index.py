@@ -52,6 +52,34 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+# matches a wikilink target, ignoring any |alias or #heading/^block suffix
+WIKILINK_RE = re.compile(r"\[\[([^\]|#^]+)(?:[#^][^\]|]*)?(?:\|[^\]]+)?\]\]")
+
+def extract_links(value) -> list[str]:
+    """flatten a frontmatter property (string, list, or nested list) into plain
+    entity names, stripping [[ ]] wrappers and | aliases. handles obsidian's quoted
+    list form, the unquoted form yaml reads as a nested sequence, and bare strings."""
+    names: list[str] = []
+
+    def walk(v):
+        if v is None:
+            return
+        if isinstance(v, list):
+            for item in v:
+                walk(item)
+            return
+        if not isinstance(v, str):
+            return
+        found = WIKILINK_RE.findall(v)
+        if found:
+            names.extend(s.strip() for s in found)
+        elif v.strip():
+            # bare value with no brackets (older notes)
+            names.append(v.strip())
+
+    walk(value)
+    return names
+
 def chunk_by_headers(text: str, max_tokens: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     sections = re.split(r"(?m)(?=^#{1,3} )", text)
     chunks = []
@@ -151,6 +179,8 @@ def build_index(update_only: bool = False):
             continue
 
         frontmatter, body = parse_frontmatter(content)
+        # capture inline [[wikilinks]] from the body before clean_markdown flattens them
+        inline_links = [m.strip() for m in WIKILINK_RE.findall(body)]
         body = clean_markdown(body)
 
         if not body.strip():
@@ -163,6 +193,15 @@ def build_index(update_only: bool = False):
         if isinstance(tags, str):
             tags = [tags]
 
+        # entity properties created during the wikilink migration
+        people = extract_links(frontmatter.get("people"))
+        teams = extract_links(frontmatter.get("teams"))
+        organizations = extract_links(frontmatter.get("organizations"))
+
+        # unified backlink graph for this note: property links + inline body links,
+        # deduplicated while preserving order
+        all_links = list(dict.fromkeys(people + teams + organizations + inline_links))
+
         rel_parts = Path(rel_path).parts
         folder_within_vault = str(Path(*rel_parts[1:-1])) if len(rel_parts) > 2 else ""
 
@@ -171,12 +210,19 @@ def build_index(update_only: bool = False):
             "vault": vault_name,
             "title": frontmatter.get("title", file_path.stem),
             "tags": json.dumps(tags),
+            "people": json.dumps(people),
+            "teams": json.dumps(teams),
+            "links": json.dumps(all_links),
             "folder": folder_within_vault,
             "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
         }
 
         tag_string = " ".join(tags) if tags else ""
         context_prefix = f"Note: {file_path.stem}"
+        if people:
+            context_prefix += f"\nPeople: {', '.join(people)}"
+        if teams:
+            context_prefix += f"\nTeams: {', '.join(teams)}"
         if tag_string:
             context_prefix += f"\nTags: {tag_string}"
         context_prefix += "\n\n"
