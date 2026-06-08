@@ -311,9 +311,9 @@ with st.sidebar:
 
 # check ollama is running
 try:
-    requests.get(f"{EMBED_BASE_URL}/api/tags", timeout=2)
+    requests.get(f"{EMBED_BASE_URL}/api/tags", timeout=5)
     ollama_ok = True
-except requests.ConnectionError:
+except requests.RequestException:
     ollama_ok = False
 
 if not ollama_ok:
