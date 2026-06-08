@@ -120,6 +120,7 @@ def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter
         source = meta.get("source", "")
         title = meta.get("title", "").lower()
         tags = meta.get("tags", "").lower()
+        links = meta.get("links", "").lower()
         folder = meta.get("folder", "")
         vault = meta.get("vault", "")
         source_lower = source.lower()
@@ -129,8 +130,12 @@ def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter
         if folder_filter and folder != folder_filter:
             continue
 
+        # links is the backlink signal: a note that links [[Hannah Garcia]] in a
+        # people/teams property (or inline) matches a query naming her, the same way
+        # obsidian's backlinks panel would surface it
         hit = any(
             whole_word_match(w, tags) or
+            whole_word_match(w, links) or
             whole_word_match(w, title) or
             whole_word_match(w, source_lower)
             for w in words
@@ -151,7 +156,12 @@ def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter
                 }
 
     keyword_chunks = list(source_best.values())
+    # a note matching only because it IS the entity's own stub (Directory/People/...)
+    # is far less useful than a note that links to that entity, so push stubs to the
+    # back. stable sort: order by recency first, then float stubs down. newest-first
+    # also partially handles "last week" intent.
     keyword_chunks.sort(key=lambda x: x.get("modified", ""), reverse=True)
+    keyword_chunks.sort(key=lambda x: x["source"].startswith("Directory/"))
     return keyword_chunks[:TOP_K]
 
 
@@ -311,9 +321,9 @@ with st.sidebar:
 
 # check ollama is running
 try:
-    requests.get(f"{EMBED_BASE_URL}/api/tags", timeout=5)
+    requests.get(f"{EMBED_BASE_URL}/api/tags", timeout=2)
     ollama_ok = True
-except requests.RequestException:
+except requests.ConnectionError:
     ollama_ok = False
 
 if not ollama_ok:
