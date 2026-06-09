@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime, timedelta, date
 from pathlib import Path
 
 import anthropic
@@ -80,13 +81,76 @@ def get_folders_for_vault(collection, vault_name: str = None) -> list[str]:
         return []
 
 
-def build_where_clause(vault_filter: str, folder_filter: str) -> dict | None:
-    """build a chroma where clause from vault and folder filters."""
+def _to_int(d: date) -> int:
+    return d.year * 10000 + d.month * 100 + d.day
+
+def _fmt(yyyymmdd: int) -> str:
+    s = str(yyyymmdd)
+    return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+
+def parse_date_range(query: str, today: date) -> tuple[int, int, str] | None:
+    """detect a relative time expression in the query and return
+    (start_yyyymmdd, end_yyyymmdd, human_label), or None if none is found.
+    weeks are calendar weeks (monday start); windows err slightly wide so a note on
+    the boundary isn't dropped."""
+    q = query.lower()
+
+    def span(start: date, end: date, label: str):
+        return (_to_int(start), _to_int(end), label)
+
+    # "past/last/previous N days|weeks|months|years" (explicit count)
+    m = re.search(r"\b(?:past|last|previous)\s+(\d+)\s+(day|week|month|year)s?\b", q)
+    if m:
+        n = int(m.group(1))
+        per = {"day": 1, "week": 7, "month": 30, "year": 365}[m.group(2)]
+        start = today - timedelta(days=per * n)
+        return span(start, today, f"the past {n} {m.group(2)}{'s' if n != 1 else ''}")
+
+    if "yesterday" in q:
+        y = today - timedelta(days=1)
+        return span(y, y, "yesterday")
+    if "today" in q:
+        return span(today, today, "today")
+
+    this_week_start = today - timedelta(days=today.weekday())  # monday of this week
+    if "past week" in q:
+        return span(today - timedelta(days=7), today, "the past week")
+    if "last week" in q or "previous week" in q:
+        return span(this_week_start - timedelta(days=7), this_week_start - timedelta(days=1), "last week")
+    if "this week" in q:
+        return span(this_week_start, today, "this week")
+
+    first_of_month = today.replace(day=1)
+    if "past month" in q:
+        return span(today - timedelta(days=30), today, "the past month")
+    if "last month" in q or "previous month" in q:
+        prev_end = first_of_month - timedelta(days=1)
+        return span(prev_end.replace(day=1), prev_end, "last month")
+    if "this month" in q:
+        return span(first_of_month, today, "this month")
+
+    if "last year" in q or "previous year" in q:
+        return span(date(today.year - 1, 1, 1), date(today.year - 1, 12, 31), "last year")
+    if "this year" in q:
+        return span(date(today.year, 1, 1), today, "this year")
+
+    if "recent" in q or "lately" in q:  # also matches "recently"
+        return span(today - timedelta(days=30), today, "the last 30 days")
+
+    return None
+
+
+def build_where_clause(vault_filter: str, folder_filter: str, date_range: tuple | None = None) -> dict | None:
+    """build a chroma where clause from vault, folder, and optional date filters."""
     conditions = []
     if vault_filter:
         conditions.append({"vault": {"$eq": vault_filter}})
     if folder_filter:
         conditions.append({"folder": {"$eq": folder_filter}})
+    if date_range:
+        start, end, _ = date_range
+        conditions.append({"date_int": {"$gte": start}})
+        conditions.append({"date_int": {"$lte": end}})
 
     if len(conditions) == 0:
         return None
@@ -95,7 +159,7 @@ def build_where_clause(vault_filter: str, folder_filter: str) -> dict | None:
     return {"$and": conditions}
 
 
-def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter: str = None) -> list[dict]:
+def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter: str = None, date_range: tuple | None = None) -> list[dict]:
     stopwords = {
         "the", "was", "last", "time", "when", "did", "with", "have", "about",
         "what", "that", "this", "for", "chatted", "talked", "met", "meeting",
@@ -129,21 +193,30 @@ def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter
             continue
         if folder_filter and folder != folder_filter:
             continue
+        if date_range:
+            start, end, _ = date_range
+            note_date = meta.get("date_int")
+            # only filter out notes that have a date and fall outside the window;
+            # undated chunks are kept rather than silently dropped
+            if note_date is not None and not (start <= note_date <= end):
+                continue
 
         # links is the backlink signal: a note that links [[Hannah Garcia]] in a
         # people/teams property (or inline) matches a query naming her, the same way
-        # obsidian's backlinks panel would surface it
-        hit = any(
-            whole_word_match(w, tags) or
-            whole_word_match(w, links) or
-            whole_word_match(w, title) or
-            whole_word_match(w, source_lower)
-            for w in words
-        )
+        # obsidian's backlinks panel would surface it. count how many *distinct* query
+        # words a note matches so that "hannah garcia" (2 words) outranks the many
+        # notes that only match "hannah" (e.g. every [[Hannah Kahn]] note).
+        matched = {
+            w for w in words
+            if whole_word_match(w, tags)
+            or whole_word_match(w, links)
+            or whole_word_match(w, title)
+            or whole_word_match(w, source_lower)
+        }
 
-        if hit:
+        if matched:
             existing = source_best.get(source)
-            if existing is None or len(doc) > len(existing["text"]):
+            if existing is None:
                 source_best[source] = {
                     "text": doc,
                     "source": source,
@@ -151,24 +224,31 @@ def keyword_scan(query: str, collection, vault_filter: str = None, folder_filter
                     "title": meta.get("title", ""),
                     "folder": folder,
                     "modified": meta.get("modified", ""),
+                    "date_int": meta.get("date_int"),
+                    "match_count": len(matched),
                     "similarity": 1.0,
                     "match_type": "keyword",
                 }
+            else:
+                # keep the longest chunk's text, but track the best match count
+                # seen across all chunks of this note
+                if len(doc) > len(existing["text"]):
+                    existing["text"] = doc
+                existing["match_count"] = max(existing["match_count"], len(matched))
 
     keyword_chunks = list(source_best.values())
-    # a note matching only because it IS the entity's own stub (Directory/People/...)
-    # is far less useful than a note that links to that entity, so push stubs to the
-    # back. stable sort: order by recency first, then float stubs down. newest-first
-    # also partially handles "last week" intent.
+    # stable sorts, applied least-significant first, so the final priority is:
+    # real notes before entity stubs -> more query words matched -> more recent.
+    # the match-count rank is what separates "hannah garcia" from "hannah" alone.
     keyword_chunks.sort(key=lambda x: x.get("modified", ""), reverse=True)
+    keyword_chunks.sort(key=lambda x: x.get("match_count", 0), reverse=True)
     keyword_chunks.sort(key=lambda x: x["source"].startswith("Directory/"))
     return keyword_chunks[:TOP_K]
 
 
-def retrieve_context(query: str, collection, vault_filter: str = None, folder_filter: str = None) -> list[dict]:
-    """hybrid retrieval keyword scan + semantic search, merged and deduplicated."""
-    query_embedding = get_embedding(query)
-    where_clause = build_where_clause(vault_filter, folder_filter)
+def _retrieve(query: str, collection, query_embedding, vault_filter, folder_filter, date_range) -> list[dict]:
+    """one hybrid retrieval pass for a given (possibly None) date_range."""
+    where_clause = build_where_clause(vault_filter, folder_filter, date_range)
 
     results = collection.query(
         query_embeddings=[query_embedding],
@@ -190,11 +270,12 @@ def retrieve_context(query: str, collection, vault_filter: str = None, folder_fi
             "title": meta.get("title", ""),
             "folder": meta.get("folder", ""),
             "modified": meta.get("modified", ""),
+            "date_int": meta.get("date_int"),
             "similarity": round(1 - dist, 3),
             "match_type": "semantic",
         })
 
-    keyword_chunks = keyword_scan(query, collection, vault_filter, folder_filter)
+    keyword_chunks = keyword_scan(query, collection, vault_filter, folder_filter, date_range)
     seen_sources = set(c["source"] for c in keyword_chunks)
 
     merged = keyword_chunks[:]
@@ -206,9 +287,36 @@ def retrieve_context(query: str, collection, vault_filter: str = None, folder_fi
     return merged[:TOP_K]
 
 
+def retrieve_context(query: str, collection, vault_filter: str = None, folder_filter: str = None,
+                     today: date = None) -> tuple[list[dict], str | None]:
+    """hybrid retrieval (keyword/backlink scan + semantic), optionally scoped to a date
+    window parsed from the query. returns (chunks, scope_label). if a window is detected
+    but no notes fall inside it, retries unscoped so the user still gets an answer."""
+    today = today or datetime.now().date()
+    query_embedding = get_embedding(query)
+    date_range = parse_date_range(query, today)
+
+    chunks = _retrieve(query, collection, query_embedding, vault_filter, folder_filter, date_range)
+
+    if date_range is None:
+        return chunks, None
+
+    start, end, label = date_range
+    if chunks:
+        return chunks, f"{label} ({_fmt(start)} to {_fmt(end)})"
+
+    # nothing dated inside the window — fall back to an unscoped search
+    chunks = _retrieve(query, collection, query_embedding, vault_filter, folder_filter, None)
+    return chunks, f"{label}: no notes dated in that window, showing all matches"
+
+
 def build_system_prompt() -> str:
-    return """You are a knowledgeable assistant with access to the user's Obsidian notes.
+    today = datetime.now().strftime("%A, %B %d, %Y")
+    return f"""You are a knowledgeable assistant with access to the user's Obsidian notes.
 Your job is to answer questions grounded in those notes, synthesizing and connecting ideas across them.
+
+Today's date is {today}. Each note excerpt is labeled with its date; use it to reason about
+relative time references like "last week" or "recently".
 
 Guidelines:
 - Answer based on what's in the provided note excerpts
@@ -223,8 +331,9 @@ def format_context(chunks: list[dict]) -> str:
     parts = []
     for i, chunk in enumerate(chunks, 1):
         vault_label = f" [{chunk['vault']}]" if chunk.get("vault") else ""
+        date_label = f" | date: {_fmt(chunk['date_int'])}" if chunk.get("date_int") else ""
         parts.append(
-            f"[Note {i}: {chunk['title']}{vault_label} | {chunk['source']} | similarity: {chunk['similarity']}]\n{chunk['text']}"
+            f"[Note {i}: {chunk['title']}{vault_label} | {chunk['source']}{date_label} | similarity: {chunk['similarity']}]\n{chunk['text']}"
         )
     return "\n\n---\n\n".join(parts)
 
@@ -362,10 +471,13 @@ if prompt := st.chat_input("Ask a question about your notes..."):
     with st.chat_message("assistant"):
         with st.spinner("Searching notes..."):
             try:
-                chunks = retrieve_context(prompt, collection, vault_filter, folder_filter)
+                chunks, scope = retrieve_context(prompt, collection, vault_filter, folder_filter)
             except Exception as e:
                 st.error(f"Retrieval error: {e}")
                 st.stop()
+
+        if scope:
+            st.caption(f"Scoped to {scope}")
 
         with st.spinner("Thinking..."):
             try:
